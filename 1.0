@@ -1,0 +1,18 @@
+#include <cufftXt.h>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <stdio.h>
+#include <vector>
+#include <string>
+#include <time.h>
+#include <math.h>
+#include <random> // The header for the generators.
+#include <iomanip>
+#include "cuda_runtime.h"
+
+int main() {
+	printf("hello world");
+	return 0;
+}
+
