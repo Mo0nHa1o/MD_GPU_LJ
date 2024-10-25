@@ -1,0 +1,286 @@
+#include <cufftXt.h>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <stdio.h>
+#include <vector>
+#include <string>
+#include <time.h>
+#include <math.h>
+#include <random> // The header for the generators.
+#include <iomanip>
+#include "cuda_runtime.h"
+#include <cuda_runtime.h>
+#include <cuda.h>
+#include <device_atomic_functions.h>
+
+//Definitions=======================================================================
+// Define the precision of real numbers, could be float/double.
+#define real double
+#define Pi 3.1415926535897932384626433832795
+#define Zero 0
+//typedef double2 Complex;
+using namespace std;
+
+struct Particle {
+	real* x;//save x position in GPU
+	real* y;//save y position in GPU
+	int* cellX;//save xth cell of nth particle
+	int* cellY;//save yth cell of nth particle
+	int* cellList;//cell particle id for all particle, as [maxParticlePerCell*id + offsetCl]
+	int* cellOffsetsCL;//offset of every cell list to save particle number in this cell 
+	int* particleAroundId;//save ids around this on particle, use rd to judge wether is "around"
+	int* particleAroundFlagX;//mask whether cell of idth particle at the edge of box
+	int* particleAroundFlayY;//mask whether cell of idth particle at the edge of box
+	int* offsetNL;//offset of every particle's neighbor list to save neighbor particle id
+	int* NeighborList;//neighbor list
+	int* NeighborListFlagX;//translate from particleAroundFlagX
+	int* NeighborListFlagY;//translate from particleAroundFlagY
+	real* fx;//force on the x direction
+	real* fy;//force on the y direction
+	real* x0ToUpdateHybridList;//save xGpu[id] to judge whether update hybrid list 
+	real* y0ToUpdateHybridList;//save yGpu[id] to judge whether update hybrid list
+} PT, pt;
+
+struct Parameter {
+	real boxX;//box size X
+	real boxY;//box size Y
+	real cellSizeX;//cell size in the x direction
+	real cellSizeY;//cell size in the y direction
+	int cellNumX;//num of cell in the x direction
+	int cellNumY;//num of cell in the y direction
+	real rho;		//密度
+	int maxParticlePerCell;//theory maxmum particle number in one cell
+	real rd;//deadline distance to get particleAroundId
+	int mask0;//use for bit calculate
+	int mask1;//use for bit calculate 	
+	real miniInstanceBetweenParticle;//theory minimum distance from two particle
+	real r0;//balance position
+	real epsilon;//coefficient of force
+	int kBT;//kB*T
+	int gammaValue;//Viscosity coefficien
+	real rOutUpdateList;//update hybrid list when any one particle move a distance greater than rOutUpdateList
+	int particleNum; //粒子数目
+	real tStart;
+	real tStop;
+	real tStep;
+} PM;
+
+void getInput() {
+    std::ifstream InputFile("input.dat");
+
+    if (!InputFile.is_open()) {
+        std::cerr << "Error opening input file!" << std::endl;
+        return; // 退出函数
+    }
+
+    std::string line;
+    int lineCount = 0;
+
+    while (std::getline(InputFile, line)) {
+        // 检查是否为注释行
+        if (line.empty() || line.find('#') != std::string::npos) {
+            continue; // 跳过空行和注释行
+        }
+
+        std::istringstream iss(line);
+        switch (lineCount) {
+        case 0: iss >> PM.boxX; break;
+        case 1: iss >> PM.boxY; break;
+        case 2: iss >> PM.cellSizeX; break;
+        case 3: iss >> PM.cellSizeY; break;
+        case 4: iss >> PM.cellNumX; break;
+        case 5: iss >> PM.cellNumY; break;
+        case 6: iss >> PM.rho; break;
+        case 7: iss >> PM.maxParticlePerCell; break;
+        case 8: iss >> PM.rd; break;
+        case 9: iss >> PM.mask0; break;
+        case 10: iss >> PM.mask1; break;
+        case 11: iss >> PM.miniInstanceBetweenParticle; break;
+        case 12: iss >> PM.r0; break;
+        case 13: iss >> PM.epsilon; break;
+        case 14: iss >> PM.kBT; break;
+        case 15: iss >> PM.gammaValue; break;
+        case 16: iss >> PM.rOutUpdateList; break;
+        case 17: iss >> PM.particleNum; break;
+        case 18: iss >> PM.tStart; break;
+        case 19: iss >> PM.tStop; break;
+        case 20: iss >> PM.tStep; break;
+        default: break; // 超过预期行数时不处理
+        }
+        lineCount++;
+    }
+
+    InputFile.close();
+}
+
+void printInput() {
+    std::cout << "Box X: " << PM.boxX << std::endl;
+    std::cout << "Box Y: " << PM.boxY << std::endl;
+    std::cout << "Cell size X: " << PM.cellSizeX << std::endl;
+    std::cout << "Cell size Y: " << PM.cellSizeY << std::endl;
+    std::cout << "Cell num X: " << PM.cellNumX << std::endl;
+    std::cout << "Cell num Y: " << PM.cellNumY << std::endl;
+    std::cout << "Density: " << PM.rho << std::endl;
+    std::cout << "Max particle per cell: " << PM.maxParticlePerCell << std::endl;
+    std::cout << "Deadline distance: " << PM.rd << std::endl;
+    std::cout << "Mask 0: " << PM.mask0 << std::endl;
+    std::cout << "Mask 1: " << PM.mask1 << std::endl;
+    std::cout << "Mini instance between particle: " << PM.miniInstanceBetweenParticle << std::endl;
+    std::cout << "Equilibrium position: " << PM.r0 << std::endl;
+    std::cout << "Epsilon: " << PM.epsilon << std::endl;
+    std::cout << "kBT: " << PM.kBT << std::endl;
+    std::cout << "Gamma value: " << PM.gammaValue << std::endl;
+    std::cout << "Update list distance threshold: " << PM.rOutUpdateList << std::endl;
+    std::cout << "Particle num: " << PM.particleNum << std::endl;
+    std::cout << "Start time: " << PM.tStart << std::endl;
+    std::cout << "Stop time: " << PM.tStop << std::endl;
+    std::cout << "Time step: " << PM.tStep << std::endl;
+}
+
+void Init_Coords(int flag, Particle pt, Parameter PM) {
+    /*
+    flag代表系统的初始化方式，flag=0代表均匀分布，flag=1代表随机分布
+    当按照均匀分布时，需给定粒子密度，会同时按照初始粒子数目,初始系统的周期盒大小；
+    当按照随机分布时，需给定粒子数目，随机生成粒子坐标
+    */
+
+    if (flag == 0){
+        //初始周期盒长度
+        int N = PM.particleNum;
+        float rho = PM.rho;
+        float L = sqrt(N / rho);
+        //考虑正方形盒子
+        float xBox = L;
+        float yBox = L;
+        PM.boxX = xBox;
+        PM.boxY = yBox;
+        int initUcell = sqrt(N); //初始x,y,方向粒子数目
+        float d_lattice = L / sqrt(N); //晶格间距
+        //均匀分布 系统以原点为中心
+        int n, nx, ny;
+        n = 0;
+        for (ny = 0;ny < initUcell; ny++) {
+            for (nx = 0;nx < initUcell; nx++) {
+                pt.x[n] = nx * d_lattice;
+                pt.y[n] = ny * d_lattice;
+                n++;
+            }
+        }
+    }
+    //随机分布 均匀分布的随机数生成器
+    else if (flag == 1){
+        std::default_random_engine e;
+        std::uniform_real_distribution<double> u(0.0, 1.0);
+        e.seed(time(0));
+
+        for (int n = 0; n < PM.particleNum; n++) {
+            pt.x[n] = u(e) * PM.boxX;
+            pt.y[n] = u(e) * PM.boxY;
+            //cout << u(e)<<"," << PM.boxX <<"," << pt.x[n] << endl;
+        }
+    }
+}
+
+//mem ============================================================================================================
+
+void MemAlloc() {
+    // Allocate particle mem in host memory.
+    pt.x = new real[PM.particleNum];
+    pt.y = new real[PM.particleNum];
+    pt.cellList = new int[PM.cellNumX * PM.cellNumY * PM.maxParticlePerCell];
+    pt.cellOffsetsCL = new int[PM.cellNumX * PM.cellNumY * PM.maxParticlePerCell];
+    pt.particleAroundId = new int[9 * PM.particleNum];
+    pt.particleAroundFlagX = new int[PM.particleNum];
+    pt.particleAroundFlayY = new int[PM.particleNum];
+    pt.offsetNL = new int[PM.particleNum];
+    pt.NeighborList = new int[PM.particleNum * PM.maxParticlePerCell];
+    pt.NeighborListFlagX = new int[PM.particleNum];
+    pt.NeighborListFlagY = new int[PM.particleNum];
+    pt.fx = new real[PM.particleNum];
+    pt.fy = new real[PM.particleNum];
+    pt.x0ToUpdateHybridList = new real[PM.particleNum];
+    pt.y0ToUpdateHybridList = new real[PM.particleNum];
+
+
+    // Allocate memory of fields in device.
+    cudaMalloc((void**)&PT.cellX, PM.particleNum * sizeof(int));
+    cudaMalloc((void**)&PT.cellY, PM.particleNum * sizeof(int));
+    cudaMalloc((void**)&PT.cellList, PM.cellNumX * PM.cellNumY * PM.maxParticlePerCell * sizeof(real));
+    cudaMalloc((void**)&PT.cellOffsetsCL, PM.cellNumX * PM.cellNumY * PM.maxParticlePerCell * sizeof(real));
+    cudaMalloc((void**)&PT.particleAroundId, 9 * PM.particleNum * sizeof(int));
+    cudaMalloc((void**)&PT.particleAroundFlagX, PM.particleNum);
+    cudaMalloc((void**)&PT.particleAroundFlayY, PM.particleNum);
+    cudaMalloc((void**)&PT.offsetNL, PM.particleNum);
+    cudaMalloc((void**)&PT.NeighborList, PM.particleNum * PM.maxParticlePerCell * sizeof(int));
+    cudaMalloc((void**)&PT.NeighborListFlagX, PM.particleNum * sizeof(int));
+    cudaMalloc((void**)&PT.NeighborListFlagY, PM.particleNum * sizeof(int));
+    cudaMalloc((void**)&PT.fx, PM.particleNum * sizeof(real));
+    cudaMalloc((void**)&PT.fy, PM.particleNum * sizeof(real));
+    cudaMalloc((void**)&PT.x0ToUpdateHybridList, PM.particleNum * sizeof(real));
+    cudaMalloc((void**)&PT.y0ToUpdateHybridList, PM.particleNum * sizeof(real));
+    cudaMalloc((void**)&PT.x, PM.particleNum * sizeof(real));
+    cudaMalloc((void**)&PT.y, PM.particleNum * sizeof(real));
+}
+
+//上传=============================================================================================
+void HostUpdataToDevice() {
+    cudaMemcpy(PT.x, pt.x, PM.particleNum * sizeof(real), cudaMemcpyHostToDevice);
+    cudaMemcpy(PT.x, pt.x, PM.particleNum * sizeof(real), cudaMemcpyHostToDevice);
+}
+
+//下载=============================================================================================
+void DeviceUpdataToHost() {
+    cudaMemcpy(pt.x, PT.x, PM.particleNum * sizeof(real), cudaMemcpyDeviceToHost);
+    cudaMemcpy(pt.y, PT.y, PM.particleNum * sizeof(real), cudaMemcpyDeviceToHost);
+}
+__global__ void putout(Particle PT) {
+    printf("hello world");
+    //for(int i=0;i<5;i++)printf("-----------%f\n", PT.x[i]);
+}
+
+//==========================================================================================================
+__device__ void getCellList(int id, Particle PT, Parameter PM) {
+    PT.cellX[id] = std::floor(PT.x[id] / PM.cellSizeX);
+    PT.cellY[id] = std::floor(PT.y[id] / PM.cellSizeY);
+    int cellId = PT.cellY[id] * PM.cellNumX + PT.cellX[id];
+    int offsetCL = atomicAdd(&PT.cellOffsetsCL[cellId], 1); 
+    if (offsetCL < PM.maxParticlePerCell) {
+        PT.cellList[cellId * PM.maxParticlePerCell + offsetCL] = id;
+    }
+    else {
+        printf("wrong");//append cout error later
+    }
+    __syncthreads();
+}
+
+//==========================================================
+__global__ void getHybridList(Particle PT, Parameter PM) {
+    int id = blockIdx.y * blockDim.y + blockIdx.x;
+    getCellList(id,PT,PM);
+    printf("%d\n", id);
+    //updateHybridList(PT,PM);
+}
+
+//test main code======================================================
+// 主函数
+int main()
+{	
+	clock_t clockNow = clock();
+	float tNow = PM.tStart;
+    getInput();
+    MemAlloc();
+    printInput();
+    Init_Coords(0, pt, PM);
+    HostUpdataToDevice();
+    getHybridList << <4, 4 >> > (PT, PM);
+    //for (int i = 0;i < PM.particleNum;i++) {
+    //    std::cout << pt.x[i] <<","<<pt.y[i] << std::endl;
+    //}
+    //DeviceUpdataToHost();
+    //putout <<<1, 1>>> (PT);
+    //for (int i = 0;i < PM.particleNum;i++)std::cout << i << pt.x[i] << std::endl;
+    return 0; // 返回成功状态
+}
+
+
