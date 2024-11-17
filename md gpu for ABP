@@ -574,8 +574,8 @@ __global__ void updatePosition_(Particle PT, Parameter PM) {
     real FRy = generateNormal(&PT.state[id]);
     real FRtheta = generateNormal(&PT.state[id]);
     //first step update
-    PT.x[id] = fmod(PT.x[id] + PM.v0*cos(PT.theta[id]) + (PT.fx[id] * PM.tStep + fT * FRx) / PM.gammaValue + PM.boxX, PM.boxX);
-    PT.y[id] = fmod(PT.y[id] + PM.v0*sin(PT.theta[id]) +  (PT.fy[id] * PM.tStep + fT * FRy) / PM.gammaValue + PM.boxY, PM.boxY);
+    PT.x[id] = fmod(PT.x[id] + PM.v0*cos(PT.theta[id]) * PM.tStep + (PT.fx[id] * PM.tStep + fT * FRx) / PM.gammaValue + PM.boxX, PM.boxX);
+    PT.y[id] = fmod(PT.y[id] + PM.v0*sin(PT.theta[id]) * PM.tStep +  (PT.fy[id] * PM.tStep + fT * FRy) / PM.gammaValue + PM.boxY, PM.boxY);
     PT.theta[id] = fmod(PT.theta[id] +  fT * FRy/ PM.gammaValue,2*Pi);
 }
 
