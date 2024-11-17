@@ -340,6 +340,7 @@ void Init_Coords(int flag, Particle pt, Parameter PM) {
             int flag = 0;
             pt.x[n] = u(e) * PM.boxX;
             pt.y[n] = u(e) * PM.boxY;
+            pt.theta[n] = u(e) * 2 * Pi;
             while (1) {
                 for (int m = 0; m < n; m++) {
                     // 计算两个粒子之间的距离，考虑周期性边界条件
@@ -565,7 +566,7 @@ __device__ real generateNormal(curandState* state) {
 }
 
 //==========================================================================================================
-__global__ void updatePosition_(Particle PT, Parameter PM) {
+__global__ void updatePosition(Particle PT, Parameter PM) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= PM.particleNum)return;
     real fT = sqrt( PM.kBT * PM.gammaValue * PM.tStep);
